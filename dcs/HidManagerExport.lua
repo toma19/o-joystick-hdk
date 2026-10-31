@@ -189,6 +189,7 @@ CONTROLS.HUD = {
 --                   ctx.Argument(n)       cockpit argument value
 --                   ctx.Indication(id)    { field = text } of a display
 --                   ctx.Engine()          LoGetEngineInfo() table
+--                   ctx.Now               current time (seconds)
 --   Type          "boolean"  -> 0 / 1
 --                 "number"   -> formatted with Precision decimals
 --                 "position" -> 0-based index of nearest Positions value
@@ -239,6 +240,69 @@ local function BingoLbs(ctx)
     return tonumber((text:gsub("%s", "")))
 end
 
+-- Targeting pod laser firing.
+--
+-- DCS has no export value for "laser firing". The pod page on a
+-- DDI / AMPCD flashes an "L" while lasing, so the display text is
+-- searched for it. Only works while a pod page is displayed.
+--
+-- Calibrate in game: show the pod page, fire the laser and send
+-- SYS:DUMP:<id> (or SYS:DUMP for all displays). Then find the
+-- field in Logs/HidManager_Export.log and adjust Patterns.
+local LASER_FIRING = {
+    Indicators = { 2, 3, 4 },  -- left DDI, right DDI, AMPCD (verify)
+
+    -- Lua patterns matched against each "field=value" of the
+    -- display text. Default: a field whose text is just "L".
+    Patterns = { "^[^=]+=%s*L%s*$" },  -- verify
+
+    -- Keep reporting 1 this long after the last match, so the
+    -- flashing symbol does not toggle the output.
+    HoldTime = 1.0,
+
+    -- Cockpit argument of the LTD/R switch. Firing is reported
+    -- only while it is in ARM. nil to disable the check.
+    ArmArgument = 441,  -- verify
+}
+
+local LaserLastSeen = nil
+
+local function LaserFiring(ctx)
+
+    if LASER_FIRING.ArmArgument then
+        local arm = ctx.Argument(LASER_FIRING.ArmArgument)
+
+        if arm ~= nil and arm < 0.5 then
+            LaserLastSeen = nil
+            return 0
+        end
+    end
+
+    for _, id in ipairs(LASER_FIRING.Indicators) do
+        local fields = ctx.Indication(id)
+
+        if fields then
+            for name, value in pairs(fields) do
+                local entry = name .. "=" .. value
+
+                for _, pattern in ipairs(LASER_FIRING.Patterns) do
+                    if entry:find(pattern) then
+                        LaserLastSeen = ctx.Now
+                        return 1
+                    end
+                end
+            end
+        end
+    end
+
+    if LaserLastSeen and ctx.Now - LaserLastSeen < LASER_FIRING.HoldTime then
+        return 1
+    end
+
+    LaserLastSeen = nil
+    return 0
+end
+
 local OUTPUTS = {
     -- Warning / mode lights
     MASTER_CAUTION = { Argument = 13,  Type = "boolean" },
@@ -254,6 +318,8 @@ local OUTPUTS = {
 
     -- Laser: LTD/R switch ARM (1) / SAFE (0)              verify
     LASER_ARMED    = { Argument = 441, Type = "boolean" },
+    -- Targeting pod laser firing (see LASER_FIRING above)
+    LASER_FIRING   = { Type = "boolean", Read = LaserFiring },
 
     -- Fuel (lbs)
     FUEL_INTERNAL  = { Type = "number", Precision = 0, Round = 10,
@@ -708,6 +774,32 @@ local function ProcessSystemCommand(name, arg)
         return true
     end
 
+    -- Write display text to the log, for finding indication fields.
+    -- SYS:DUMP:<id> dumps one display, SYS:DUMP dumps 0-20.
+    if name == "DUMP" then
+        if type(list_indication) ~= "function" then
+            WriteLog("DUMP: list_indication not available")
+            return false
+        end
+
+        local first, last = 0, 20
+        local id = tonumber(arg)
+
+        if id then
+            first, last = id, id
+        end
+
+        for i = first, last do
+            local ok, text = pcall(list_indication, i)
+
+            if ok and type(text) == "string" and text ~= "" then
+                WriteLog("DUMP indication " .. i .. ":\n" .. text)
+            end
+        end
+
+        return true
+    end
+
     return false
 end
 
@@ -791,6 +883,7 @@ local function NewReadContext()
 
     local ctx = {}
 
+    ctx.Now = socket.gettime()
     ctx.Argument = ReadCockpitArgument
 
     ctx.Indication = function(id)
