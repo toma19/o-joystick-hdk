@@ -179,19 +179,105 @@ CONTROLS.HUD = {
 
 
 ------------------------------------------------------------
--- OUTPUT DEFINITIONS (cockpit arguments, device 0)
+-- OUTPUT DEFINITIONS
 --
+-- Each output is sent as DCS:<NAME>:<VALUE>, only when it changes.
+--
+--   Argument      cockpit argument number (device 0)
+--   Read          function(ctx) returning a number, instead of
+--                 Argument. ctx provides:
+--                   ctx.Argument(n)       cockpit argument value
+--                   ctx.Indication(id)    { field = text } of a display
+--                   ctx.Engine()          LoGetEngineInfo() table
 --   Type          "boolean"  -> 0 / 1
 --                 "number"   -> formatted with Precision decimals
 --                 "position" -> 0-based index of nearest Positions value
+--   Precision     number: decimals (default 3)
+--   Round         number: round to a multiple of this before sending
+--                 (limits traffic for slowly drifting values)
 --   DrawFallback  use LoGetAircraftDrawArgumentValue when the
 --                 cockpit argument cannot be read
+--
+-- Values marked "verify" should be checked in the cockpit with
+-- SYS:DEBUG:1 or against DCS-BIOS FA-18C_hornet.lua.
 ------------------------------------------------------------
 
+local KG_TO_LBS = 2.20462
+local IFEI_INDICATOR = 5  -- list_indication id of the IFEI (verify)
+
+-- Fuel quantities from DCS engine data, in lbs.
+local function FuelLbs(ctx, field)
+    local engine = ctx.Engine()
+
+    if not engine or type(engine[field]) ~= "number" then
+        return nil
+    end
+
+    return engine[field] * KG_TO_LBS
+end
+
+local function TotalFuelLbs(ctx)
+    local internal = FuelLbs(ctx, "fuel_internal")
+
+    if internal == nil then
+        return nil
+    end
+
+    return internal + (FuelLbs(ctx, "fuel_external") or 0)
+end
+
+-- Bingo setting as shown on the IFEI (lbs). There is no cockpit
+-- argument for it. nil while the IFEI is blank.
+local function BingoLbs(ctx)
+    local ifei = ctx.Indication(IFEI_INDICATOR)
+    local text = ifei and ifei.txt_BINGO
+
+    if not text then
+        return nil
+    end
+
+    return tonumber((text:gsub("%s", "")))
+end
+
 local OUTPUTS = {
+    -- Warning / mode lights
     MASTER_CAUTION = { Argument = 13,  Type = "boolean" },
     MASTER_MODE_AA = { Argument = 47,  Type = "boolean" },
     MASTER_MODE_AG = { Argument = 48,  Type = "boolean" },
+
+    -- Landing gear lights (green = down and locked)       verify
+    GEAR_LEFT_LT   = { Argument = 165, Type = "boolean" },
+    GEAR_NOSE_LT   = { Argument = 166, Type = "boolean" },
+    GEAR_RIGHT_LT  = { Argument = 167, Type = "boolean" },
+    -- Red light in the gear handle (gear in transit / unsafe)
+    GEAR_HANDLE_LT = { Argument = 227, Type = "boolean" },  -- verify
+
+    -- Laser: LTD/R switch ARM (1) / SAFE (0)              verify
+    LASER_ARMED    = { Argument = 441, Type = "boolean" },
+
+    -- Fuel (lbs)
+    FUEL_INTERNAL  = { Type = "number", Precision = 0, Round = 10,
+                       Read = function(ctx)
+                           return FuelLbs(ctx, "fuel_internal")
+                       end },
+    FUEL_TOTAL     = { Type = "number", Precision = 0, Round = 10,
+                       Read = TotalFuelLbs },
+    BINGO          = { Type = "number", Precision = 0,
+                       Read = BingoLbs },
+    -- 1 when total fuel is at or below the bingo setting
+    BINGO_REACHED  = { Type = "boolean",
+                       Read = function(ctx)
+                           local fuel = TotalFuelLbs(ctx)
+                           local bingo = BingoLbs(ctx)
+
+                           if fuel == nil or bingo == nil then
+                               return nil
+                           end
+
+                           return fuel <= bingo and 1 or 0
+                       end },
+
+    -- Display
     HUD_SYM_BRT    = { Argument = 141, Type = "number", Precision = 3,
                        DrawFallback = true },
 }
@@ -218,6 +304,7 @@ local PendingSendOffset = 1
 local PendingSendBytes = 0
 
 local LastOutputState = {}
+local FailedOutputs = {}
 
 local AircraftName = nil
 local AircraftAllowed = false
@@ -672,7 +759,73 @@ end
 -- OUTPUTS
 ------------------------------------------------------------
 
-local function ReadOutput(def)
+-- Parse list_indication() text into { field = value }.
+local function ParseIndication(id)
+
+    if type(list_indication) ~= "function" then
+        return nil
+    end
+
+    local ok, text = pcall(list_indication, id)
+
+    if not ok or type(text) ~= "string" or text == "" then
+        return nil
+    end
+
+    local fields = {}
+
+    for name, value in text:gmatch(
+        "%-%-%-%-%-+\n([^\n]+)\n([^\n]*)\n"
+    ) do
+        fields[name] = value
+    end
+
+    return fields
+end
+
+-- Per-poll read context with lazy caching, passed to Read functions.
+local function NewReadContext()
+
+    local indications = {}
+    local engine = false
+
+    local ctx = {}
+
+    ctx.Argument = ReadCockpitArgument
+
+    ctx.Indication = function(id)
+        if indications[id] == nil then
+            indications[id] = ParseIndication(id) or false
+        end
+
+        return indications[id] or nil
+    end
+
+    ctx.Engine = function()
+        if engine == false then
+            engine = nil
+
+            if type(LoGetEngineInfo) == "function" then
+                local ok, info = pcall(LoGetEngineInfo)
+
+                if ok and type(info) == "table" then
+                    engine = info
+                end
+            end
+        end
+
+        return engine
+    end
+
+    return ctx
+end
+
+local function ReadOutput(def, ctx)
+
+    if def.Read then
+        local value = def.Read(ctx)
+        return type(value) == "number" and value or nil
+    end
 
     local value = ReadCockpitArgument(def.Argument)
 
@@ -701,14 +854,30 @@ local function FormatOutput(def, value)
         return tostring(NearestIndex(def.Positions, value) - 1)
     end
 
+    if def.Round then
+        value = math.floor(value / def.Round + 0.5) * def.Round
+    end
+
     return string.format("%." .. (def.Precision or 3) .. "f", value)
 end
 
 local function UpdateOutputs()
 
+    local ctx = NewReadContext()
+
     for name, def in pairs(OUTPUTS) do
 
-        local value = ReadOutput(def)
+        local ok, value = pcall(ReadOutput, def, ctx)
+
+        if not ok then
+            -- Log each failing output once, not 20 times a second.
+            if not FailedOutputs[name] then
+                FailedOutputs[name] = true
+                LogError("output " .. name .. ": " .. tostring(value))
+            end
+
+            value = nil
+        end
 
         if value ~= nil then
             local formatted = FormatOutput(def, value)
