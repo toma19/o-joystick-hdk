@@ -198,6 +198,8 @@ CONTROLS.HUD = {
 --                 (limits traffic for slowly drifting values)
 --   DrawFallback  use LoGetAircraftDrawArgumentValue when the
 --                 cockpit argument cannot be read
+--   Interval      seconds between reads (default: every output poll,
+--                 OutputPollInterval). Use for costly or slow values.
 --
 -- Values marked "verify" should be checked in the cockpit with
 -- SYS:DEBUG:1 or against DCS-BIOS FA-18C_hornet.lua.
@@ -319,7 +321,9 @@ local OUTPUTS = {
     -- Laser: LTD/R switch ARM (1) / SAFE (0)              verify
     LASER_ARMED    = { Argument = 441, Type = "boolean" },
     -- Targeting pod laser firing (see LASER_FIRING above)
-    LASER_FIRING   = { Type = "boolean", Read = LaserFiring },
+    -- 5 Hz is enough: HoldTime bridges the gaps between reads.
+    LASER_FIRING   = { Type = "boolean", Read = LaserFiring,
+                       Interval = 0.2 },
 
     -- Fuel (lbs)
     FUEL_INTERNAL  = { Type = "number", Precision = 0, Round = 10,
@@ -329,9 +333,9 @@ local OUTPUTS = {
     FUEL_TOTAL     = { Type = "number", Precision = 0, Round = 10,
                        Read = TotalFuelLbs },
     BINGO          = { Type = "number", Precision = 0,
-                       Read = BingoLbs },
+                       Read = BingoLbs, Interval = 1.0 },
     -- 1 when total fuel is at or below the bingo setting
-    BINGO_REACHED  = { Type = "boolean",
+    BINGO_REACHED  = { Type = "boolean", Interval = 1.0,
                        Read = function(ctx)
                            local fuel = TotalFuelLbs(ctx)
                            local bingo = BingoLbs(ctx)
@@ -370,6 +374,7 @@ local PendingSendOffset = 1
 local PendingSendBytes = 0
 
 local LastOutputState = {}
+local OutputNextRead = {}  -- name -> time of next read (Interval)
 local FailedOutputs = {}
 
 local AircraftName = nil
@@ -761,6 +766,7 @@ local function ProcessSystemCommand(name, arg)
 
     if name == "SYNC" then
         LastOutputState = {}
+        OutputNextRead = {}
         LastOutputPoll = 0
         return true
     end
@@ -954,35 +960,55 @@ local function FormatOutput(def, value)
     return string.format("%." .. (def.Precision or 3) .. "f", value)
 end
 
+local function UpdateOutput(name, def, ctx)
+
+    local ok, value = pcall(ReadOutput, def, ctx)
+
+    if not ok then
+        -- Log each failing output once, not 20 times a second.
+        if not FailedOutputs[name] then
+            FailedOutputs[name] = true
+            LogError("output " .. name .. ": " .. tostring(value))
+        end
+
+        return
+    end
+
+    if value == nil then
+        return
+    end
+
+    local formatted = FormatOutput(def, value)
+
+    if LastOutputState[name] ~= formatted then
+        if SendOutput(name, formatted) then
+            LastOutputState[name] = formatted
+        end
+    end
+end
+
 local function UpdateOutputs()
 
     local ctx = NewReadContext()
 
     for name, def in pairs(OUTPUTS) do
 
-        local ok, value = pcall(ReadOutput, def, ctx)
+        local due = true
 
-        if not ok then
-            -- Log each failing output once, not 20 times a second.
-            if not FailedOutputs[name] then
-                FailedOutputs[name] = true
-                LogError("output " .. name .. ": " .. tostring(value))
+        if def.Interval then
+            due = ctx.Now >= (OutputNextRead[name] or 0)
+
+            if due then
+                OutputNextRead[name] = ctx.Now + def.Interval
             end
-
-            value = nil
         end
 
-        if value ~= nil then
-            local formatted = FormatOutput(def, value)
-
-            if LastOutputState[name] ~= formatted then
-                if SendOutput(name, formatted) then
-                    LastOutputState[name] = formatted
-                end
-            end
+        if due then
+            UpdateOutput(name, def, ctx)
         end
     end
 end
+
 
 
 ------------------------------------------------------------
@@ -1019,6 +1045,7 @@ local function ConfigureConnectedSocket(client)
 
     -- Resend everything after connecting.
     LastOutputState = {}
+    OutputNextRead = {}
     LastSocketPoll = 0
     LastOutputPoll = 0
 
@@ -1283,6 +1310,7 @@ function LuaExportStart()
         LastOutputPoll = 0
         LastAircraftCheck = 0
         LastOutputState = {}
+        OutputNextRead = {}
         SwitchState = {}
 
         WriteLog("HidManager export bridge started")
